@@ -75,7 +75,7 @@ rag_agent.tool(rag_search_tool)
 async def run_chatbot():
     table = db.open_table("engineering_notes")
     print("--- RAG Chatbot Initialized ---")
-    
+    print(AIConfig.model_name)
     while True:
         user_input = input("\nAsk a question (or 'quit'): ")
         if user_input.lower() == 'quit' or user_input.lower() == 'q':
