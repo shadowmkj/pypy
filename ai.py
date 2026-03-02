@@ -19,7 +19,7 @@ load_dotenv()
 
 DB_NAME = "vectordb"
 DB_USER = "postgres"
-DB_PASSWORD = "password"  
+DB_PASSWORD = "password"
 DB_HOST = "localhost"
 DB_PORT = "5432"
 TABLE_NAME = "engineering_notes"
@@ -31,6 +31,9 @@ conn = psycopg2.connect(
     host=DB_HOST,
     port=DB_PORT
 )
+
+register_vector
+
 
 class ChatMessage(TypedDict):
     """Format of messages sent to the browser/API."""
@@ -49,23 +52,24 @@ def display_message_part(part):
     # text
     elif part.part_kind == 'text':
         with st.chat_message("assistant"):
-            st.markdown(part.content)          
+            st.markdown(part.content)
 
 
 async def run_agent_with_streaming(user_input: str):
     async with rag_agent.run_stream(
         user_input,
         deps=AgentDependencies(db_connection=conn, table_name=TABLE_NAME),
-        message_history= st.session_state.messages[:-1],  # pass entire conversation so far
+        # pass entire conversation so far
+        message_history=st.session_state.messages[:-1],
     ) as result:
         partial_text = ""
         message_placeholder = st.empty()
         async for chunk in result.stream_text(delta=True):
             partial_text += chunk
             message_placeholder.markdown(partial_text)
-        filtered_messages = [msg for msg in result.new_messages() 
-                            if not (hasattr(msg, 'parts') and 
-                                    any(part.part_kind == 'user-prompt' for part in msg.parts))]
+        filtered_messages = [msg for msg in result.new_messages()
+                             if not (hasattr(msg, 'parts') and
+                                     any(part.part_kind == 'user-prompt' for part in msg.parts))]
         st.session_state.messages.extend(filtered_messages)
         st.session_state.messages.append(
             ModelResponse(parts=[TextPart(content=partial_text)])
