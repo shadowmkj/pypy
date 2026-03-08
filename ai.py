@@ -2,7 +2,9 @@ from __future__ import annotations
 from typing import Literal, TypedDict
 import asyncio
 import streamlit as st
+from config import DB_NAME, DB_HOST, DB_PASSWORD, DB_PORT, DB_USER, TABLE_NAME
 
+from pydantic import BaseModel
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -12,24 +14,15 @@ from pydantic_ai.messages import (
 
 from dotenv import load_dotenv
 
-from agent import AgentDependencies, rag_agent
+from agent import AgentDependencies, rag_agent, rag_pipeline_stream
 import psycopg2
 from pgvector.psycopg2 import register_vector
+
 load_dotenv()
 
-DB_NAME = "vectordb"
-DB_USER = "postgres"
-DB_PASSWORD = "password"
-DB_HOST = "localhost"
-DB_PORT = "5432"
-TABLE_NAME = "engineering_notes"
 
 conn = psycopg2.connect(
-    dbname=DB_NAME,
-    user=DB_USER,
-    password=DB_PASSWORD,
-    host=DB_HOST,
-    port=DB_PORT
+    dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
 )
 
 register_vector
@@ -37,39 +30,47 @@ register_vector
 
 class ChatMessage(TypedDict):
     """Format of messages sent to the browser/API."""
-    role: Literal['user', 'model']
+
+    role: Literal["user", "model"]
     timestamp: str
     content: str
 
 
 def display_message_part(part):
-    if part.part_kind == 'system-prompt':
+    if part.part_kind == "system-prompt":
         with st.chat_message("system"):
             st.markdown(f"**SyllabiQ**: {part.content}")
-    elif part.part_kind == 'user-prompt':
+    elif part.part_kind == "user-prompt":
         with st.chat_message("user"):
             st.markdown(part.content)
     # text
-    elif part.part_kind == 'text':
+    elif part.part_kind == "text":
         with st.chat_message("assistant"):
             st.markdown(part.content)
 
 
 async def run_agent_with_streaming(user_input: str):
-    async with rag_agent.run_stream(
+    # async with rag_agent.run_stream(
+    #     user_input,
+    #     deps=AgentDependencies(db_connection=conn, table_name=TABLE_NAME),
+    #     # message_history=st.session_state.messages[:-1],
+    # ) as result:
+    async for result in rag_pipeline_stream(
         user_input,
-        deps=AgentDependencies(db_connection=conn, table_name=TABLE_NAME),
-        # pass entire conversation so far
-        message_history=st.session_state.messages[:-1],
-    ) as result:
+    ):
         partial_text = ""
         message_placeholder = st.empty()
         async for chunk in result.stream_text(delta=True):
             partial_text += chunk
             message_placeholder.markdown(partial_text)
-        filtered_messages = [msg for msg in result.new_messages()
-                             if not (hasattr(msg, 'parts') and
-                                     any(part.part_kind == 'user-prompt' for part in msg.parts))]
+        filtered_messages = [
+            msg
+            for msg in result.new_messages()
+            if not (
+                hasattr(msg, "parts")
+                and any(part.part_kind == "user-prompt" for part in msg.parts)
+            )
+        ]
         st.session_state.messages.extend(filtered_messages)
         st.session_state.messages.append(
             ModelResponse(parts=[TextPart(content=partial_text)])
@@ -94,5 +95,8 @@ async def main():
             st.markdown(user_input)
         with st.chat_message("assistant"):
             await run_agent_with_streaming(user_input)
+            # response = st.write_stream(rag_pipeline_stream(user_input))
+
+
 if __name__ == "__main__":
     asyncio.run(main())

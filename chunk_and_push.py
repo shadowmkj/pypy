@@ -1,16 +1,16 @@
 import os
 import time
+import random
 
 import google.generativeai as genai
 import psycopg2
 from docling.chunking import HybridChunker
-from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.document_converter import DocumentConverter
 from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 
-os.environ["GEMINI_API_KEY"] = "AIzaSyDgDgn96TXSaMuBK0mjMXEyiUL8mie5l98"
+os.environ["GEMINI_API_KEY"] = ""
 print(os.environ.get("GEMINI_API_KEY"))
-print(os.environ.get("GOOGLE_API_KEY"))
 
 
 MD_FILE_PATH = "./markdowns/book.md"
@@ -22,9 +22,7 @@ DB_PORT = "5432"
 TABLE_NAME = "engineering_notes"
 
 
-genai.configure(
-    api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-)
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 
 conn = psycopg2.connect(
@@ -32,7 +30,7 @@ conn = psycopg2.connect(
 )
 conn.autocommit = True
 cur = conn.cursor()
-cur.execute(f"""
+cur.execute("""
 CREATE EXTENSION IF NOT EXISTS vector;
 """)
 
@@ -47,7 +45,7 @@ cur.execute(f"""
     CREATE TABLE {TABLE_NAME} (
         id SERIAL PRIMARY KEY,
         text TEXT NOT NULL,
-        embedding vector(768),  -- Gemini text-embedding-004 produces 768-dimensional vectors
+        embedding vector(1536),  -- Gemini text-embedding-004 produces 768-dimensional vectors
         filename TEXT,
         chunk_index INTEGER,
         chunk_type TEXT
@@ -59,12 +57,39 @@ cur.execute(f"""
 print(f"Table '{TABLE_NAME}' created successfully.")
 
 
-def get_embedding(text: str) -> list:
-    """Generate embedding using Gemini API."""
-    result = genai.embed_content(
-        model="models/text-embedding-004", content=text, task_type="retrieval_document"
-    )
+def retry(func, retries=5, base_delay=1):
+    for attempt in range(retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+
+            delay = base_delay * (2**attempt) + random.uniform(0, 1)
+            print(f"Retry {attempt + 1} after error: {e}")
+            time.sleep(delay)
+
+
+def get_embedding(text):
+    def call():
+        return genai.embed_content(
+            model="gemini-embedding-001", content=text, output_dimensionality=1536
+        )
+
+    result = retry(call)
     return result["embedding"]
+
+
+#
+# def get_embedding(text: str) -> list:
+#     """Generate embedding using Gemini API."""
+#     result = genai.embed_content(
+#         model="gemini-embedding-001",
+#         content=text,
+#         task_type="retrieval_document",
+#         output_dimensionality=1536,
+#     )
+#     return result["embedding"]
 
 
 def process_and_store_md(file_path: str):
@@ -72,7 +97,7 @@ def process_and_store_md(file_path: str):
     converter = DocumentConverter()
     result = converter.convert(file_path)
     doc = result.document
-    chunker = HybridChunker(max_tokens=800, overlap_tokens=100, merge_peers=True)
+    chunker = HybridChunker(max_tokens=512, overlap_tokens=100, merge_peers=True)
 
     chunk_iter = chunker.chunk(doc)
     data_to_ingest = []
@@ -86,6 +111,8 @@ def process_and_store_md(file_path: str):
             content_type = "table"
 
         embedding = get_embedding(chunk.text)
+
+        time.sleep(0.5)  # To avoid hitting rate limits
         entry = (chunk.text, embedding, os.path.basename("M3.md"), i, content_type)
         data_to_ingest.append(entry)
 

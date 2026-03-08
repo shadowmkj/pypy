@@ -26,7 +26,7 @@ if __name__ == "__main__":
             chunk_size = 5
             page_chunks = list(chunk_pages(total_pages, chunk_size))
             with ProcessPoolExecutor(
-                max_workers=4, initializer=init_worker
+                max_workers=2, initializer=init_worker
             ) as executor:
                 futures = []
                 for count, (start, end) in enumerate(page_chunks, 1):
