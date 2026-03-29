@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 
 import google.generativeai as genai
 import psycopg2
@@ -10,15 +11,24 @@ from pydantic_ai import Agent, RunContext
 from dotenv import load_dotenv
 
 from settings import AIConfig
-from config import API_KEY, DB_PASSWORD, DB_USER, DB_PORT, DB_HOST, DB_NAME, TABLE_NAME
+from config import (
+    GEMINI_API_KEY,
+    DB_PASSWORD,
+    DB_USER,
+    DB_PORT,
+    DB_HOST,
+    DB_NAME,
+    TABLE_NAME,
+    GROQ_API_KEY,
+)
 
 
 load_dotenv()
 
-genai.configure(api_key=API_KEY)  # type: ignore[attr-defined]
+genai.configure(api_key=GEMINI_API_KEY)  # type: ignore[attr-defined]
 
 # Existing environment variable usage is preserved.
-os.environ["GROQ_API_KEY"] = ""
+os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
 
 @dataclass
@@ -242,62 +252,3 @@ Rewrite the draft answer into the best possible response for the student.
                 f"Retrying in {wait:.1f}s..."
             )
             await asyncio.sleep(wait)
-
-
-async def run_chatbot() -> None:
-    """Simple CLI loop for manual testing of the pipeline."""
-
-    print("--- RAG Chatbot Initialized ---")
-    print(f"Model: {AIConfig.model_name}")
-    print(f"Database: PostgreSQL with pgvector")
-    print(f"Table: {TABLE_NAME}")
-
-    try:
-        while True:
-            user_input = input("\nAsk a question (or 'quit'): ")
-            if user_input.lower() in {"quit", "q"}:
-                break
-
-            print("\nAgent Thinking...")
-
-            retrieval = await rag_agent.run(
-                user_input,
-                deps=AgentDependencies(
-                    db_connection=conn,
-                    table_name=TABLE_NAME,
-                ),
-            )
-
-            retrieval_output = retrieval.output
-            context_text = "\n\n".join(retrieval_output.context_chunks)
-            sufficiency = (
-                "enough context"
-                if retrieval_output.enough_context
-                else "not enough context"
-            )
-
-            prompt = f"""Question:
-{user_input}
-
-Draft answer (from retrieval agent):
-{retrieval_output.draft_answer}
-
-Context sufficiency: {sufficiency}
-
-Context used:
-{context_text}
-"""
-
-            final = await answer_agent.run(prompt)
-
-            print("\n🤖 AI Response:")
-            print(final.output)
-    finally:
-        conn.close()
-        print("\nDatabase connection closed. Goodbye!")
-
-
-if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(run_chatbot())

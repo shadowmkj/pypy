@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import sys
 
 import google.generativeai as genai
 import psycopg2
@@ -12,8 +13,10 @@ from psycopg2.extras import execute_values
 os.environ["GEMINI_API_KEY"] = ""
 print(os.environ.get("GEMINI_API_KEY"))
 
+file = sys.argv[1] if len(sys.argv) > 1 else None
 
-MD_FILE_PATH = "./markdowns/book.md"
+
+MD_FILE_PATH = f"./markdowns/{file}"
 DB_NAME = "postgres"
 DB_USER = "postgres"
 DB_PASSWORD = "postgres"
@@ -113,7 +116,13 @@ def process_and_store_md(file_path: str):
         embedding = get_embedding(chunk.text)
 
         time.sleep(0.5)  # To avoid hitting rate limits
-        entry = (chunk.text, embedding, os.path.basename("M3.md"), i, content_type)
+        entry = (
+            chunk.text,
+            embedding,
+            os.path.basename(f"{file_path}.md"),
+            i,
+            content_type,
+        )
         data_to_ingest.append(entry)
 
     batch_size = 48
