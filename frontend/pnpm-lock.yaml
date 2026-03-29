@@ -75,6 +75,9 @@ importers:
       '@types/better-sqlite3':
         specifier: ^7.6.13
         version: 7.6.13
+      '@types/dom-speech-recognition':
+        specifier: ^0.0.8
+        version: 0.0.8
       '@types/jsonwebtoken':
         specifier: ^9.0.10
         version: 9.0.10
@@ -932,6 +935,9 @@ packages:
 
   '@types/debug@4.1.13':
     resolution: {integrity: sha512-KSVgmQmzMwPlmtljOomayoR89W4FynCAi3E8PPs7vmDVPe84hT+vGPKkJfThkmXs0x0jAaa9U8uW8bbfyS2fWw==}
+
+  '@types/dom-speech-recognition@0.0.8':
+    resolution: {integrity: sha512-JgpjlGQWGc+OjjTNfyJ8Ic2w2+NOdrmEpmdVAkg+sYblx8I5ZZTeA+cfxvgUMtXXT7/WzYYR2Rrp3ZDg+l/3vA==}
 
   '@types/estree-jsx@1.0.5':
     resolution: {integrity: sha512-52CcUVNFyfb1A2ALocQw/Dd1BQFNmSdkuC3BkZ6iqhdMfQz7JWOFRuJFloOzjk+6WijU56m9oKXFAXc7o3Towg==}
@@ -4589,6 +4595,8 @@ snapshots:
   '@types/debug@4.1.13':
     dependencies:
       '@types/ms': 2.1.0
+
+  '@types/dom-speech-recognition@0.0.8': {}
 
   '@types/estree-jsx@1.0.5':
     dependencies:
