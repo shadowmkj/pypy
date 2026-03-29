@@ -74,7 +74,7 @@ export const ChatContainer = ({ userInitials, userName }: ChatContainerProps) =>
                             {[
                                 "What is CPU scheduling?",
                                 "What is the difference between a queue and a stack?",
-                                "Summarize the grading criteria.",
+                                "What is a System Call? Give examples.",
                                 "How is a graph represented in memory?"
                             ].map((suggestion, i) => (
                                 <button
