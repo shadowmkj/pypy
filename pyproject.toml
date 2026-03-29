@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "docling>=2.64.0",
+    "fastapi>=0.135.2",
     "google-generativeai>=0.8.5",
     "instructor>=1.13.0",
     "ipykernel>=7.1.0",
@@ -21,4 +22,5 @@ dependencies = [
     "streamlit>=1.52.1",
     "tantivy>=0.25.1",
     "torch>=2.9.1",
+    "uvicorn>=0.38.0",
 ]
