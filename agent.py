@@ -16,6 +16,7 @@ from config import (
     DB_PASSWORD,
     DB_USER,
     DB_PORT,
+    GROQ_API_KEY,
     DB_HOST,
     DB_NAME,
     TABLE_NAME,
@@ -37,11 +38,22 @@ class AgentDependencies:
     table_name: str
 
 
-async def rag_search_tool(ctx: RunContext[AgentDependencies], query: str) -> str:
-    """Retrieve the most relevant document chunks from the knowledge base.
+async def rag_search_tool(
+    ctx: RunContext[AgentDependencies],
+    query: str,
+    limit: int = 10,
+    alpha: float = 0.7,
+) -> str:
+    """Hybrid retrieval for the most relevant document chunks.
 
-    Uses the query to compute an embedding, runs a similarity search in
-    PostgreSQL via pgvector, and returns a formatted context string.
+    - Computes an embedding for the query and uses pgvector for semantic
+      similarity.
+    - Uses pg_trgm `similarity(text, query)` for lexical matching.
+    - Combines both into a single hybrid score:
+
+        hybrid_score = alpha * semantic_score + (1 - alpha) * keyword_score
+
+      where semantic_score = 1 - (embedding <=> query_embedding).
     """
 
     conn = ctx.deps.db_connection
@@ -58,20 +70,43 @@ async def rag_search_tool(ctx: RunContext[AgentDependencies], query: str) -> str
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             f"""
-            SELECT text, filename, chunk_index, chunk_type,
-                   1 - (embedding <=> %s::vector) as similarity
+            SELECT
+                text,
+                filename,
+                chunk_index,
+                chunk_type,
+                1 - (embedding <=> %s::vector) AS semantic_score,
+                similarity(text, %s) AS keyword_score,
+                (
+                    %s * (1 - (embedding <=> %s::vector))
+                    + (1 - %s) * similarity(text, %s)
+                ) AS hybrid_score
             FROM {table_name}
-            ORDER BY embedding <=> %s::vector
-            LIMIT 10
-        """,
-            (query_embedding, query_embedding),
+            ORDER BY hybrid_score DESC
+            LIMIT %s
+            """,
+            (
+                query_embedding,
+                query,
+                alpha,
+                query_embedding,
+                alpha,
+                query,
+                limit,
+            ),
         )
         results = cur.fetchall()
 
-    print(f"RAG Tool - Retrieved {len(results)} results from PostgreSQL.")
+    print(
+        f"RAG Tool (hybrid) - Retrieved {len(results)} results "
+        f"from PostgreSQL with alpha={alpha}, limit={limit}."
+    )
     for r in results:
         print(
-            f"Text Snippet: {r['text'][:100]!r}... (similarity: {r['similarity']:.4f})"
+            f"Snippet: {r['text'][:100]!r}... "
+            f"(semantic={r['semantic_score']:.4f}, "
+            f"keyword={r['keyword_score']:.4f}, "
+            f"hybrid={r['hybrid_score']:.4f})"
         )
 
     context = "\n---\n".join([f"Content: {res['text']}" for res in results])
@@ -111,29 +146,38 @@ rag_agent = Agent(
         """
 You are SyllabiQ's retrieval and planning agent.
 
-Your job is iterative retrieval and planning for a RAG system:
+Your job is iterative hybrid retrieval and planning for a RAG system.
+
+Capabilities:
+- You can call `rag_search_tool(query: str, limit: int = 10, alpha: float = 0.7)`
+  multiple times.
+- Each call performs HYBRID retrieval over the knowledge base using both
+  semantic (pgvector) and lexical (pg_trgm) similarity.
+
+Workflow:
 
 1. Start from the student's question.
-2. Call `rag_search_tool` with the question or with refined sub‑queries to
-   retrieve relevant chunks from the knowledge base.
-3. After each retrieval, think about whether the information you have is
-   enough to answer the question reliably.
-4. If it is not enough, refine the query and call `rag_search_tool` again.
-   You can do this multiple times.
-5. Stop calling tools once you have:
-   - good coverage of the question, or
-   - clear evidence that the knowledge base does not contain the answer.
+2. Form an initial retrieval query (often the question itself) and call
+   `rag_search_tool`.
+3. Carefully read the returned chunks. Decide:
+   - what parts of the question are still not covered;
+   - what follow-up or more specific sub-queries are needed.
+4. Refine the query (for example, add course/unit/topic keywords, important
+   terms, or constraints) and call `rag_search_tool` again.
+5. Repeat steps 3–4, up to about 3–5 tool calls in total, until:
+   - you have enough coverage to answer the question reliably, or
+   - it is clear the knowledge base does not contain the answer.
 
 When you finish, fill the `RetrievalResult` fields as follows:
 - `enough_context`: true only if the retrieved chunks clearly provide enough
   information to answer the question. Otherwise false.
-- `draft_answer`: a careful, step‑by‑step answer that uses only the retrieved
+- `draft_answer`: a careful, step-by-step answer that uses only the retrieved
   chunks. If context is not enough, clearly say that and explain what is
   missing or why the syllabus does not cover it.
 - `context_chunks`: a list of the most relevant text snippets you actually
   used when forming the answer. Prefer concise but complete excerpts.
 - `notes`: (optional) short planner notes about how many retrieval calls
-  you made and why you stopped.
+  you made, which queries you used, and why you stopped.
 
 Rules:
 - Use ONLY the knowledge you retrieved with `rag_search_tool`.

@@ -10,22 +10,23 @@ from docling.document_converter import DocumentConverter
 from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 
-os.environ["GEMINI_API_KEY"] = ""
-print(os.environ.get("GEMINI_API_KEY"))
+from config import (
+    DB_NAME,
+    DB_USER,
+    DB_PASSWORD,
+    DB_HOST,
+    DB_PORT,
+    TABLE_NAME,
+    GEMINI_API_KEY,
+)
 
 file = sys.argv[1] if len(sys.argv) > 1 else None
 
 
 MD_FILE_PATH = f"./markdowns/{file}"
-DB_NAME = "postgres"
-DB_USER = "postgres"
-DB_PASSWORD = "postgres"
-DB_HOST = "localhost"
-DB_PORT = "5432"
-TABLE_NAME = "engineering_notes"
 
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+genai.configure(api_key=GEMINI_API_KEY)
 
 
 conn = psycopg2.connect(
@@ -35,6 +36,7 @@ conn.autocommit = True
 cur = conn.cursor()
 cur.execute("""
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 """)
 
 register_vector(conn)
@@ -42,10 +44,9 @@ register_vector(conn)
 
 cur.execute(f"""
     CREATE EXTENSION IF NOT EXISTS vector;
+    CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
-    DROP TABLE IF EXISTS {TABLE_NAME};
-
-    CREATE TABLE {TABLE_NAME} (
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
         id SERIAL PRIMARY KEY,
         text TEXT NOT NULL,
         embedding vector(1536),  -- Gemini text-embedding-004 produces 768-dimensional vectors
@@ -54,10 +55,14 @@ cur.execute(f"""
         chunk_type TEXT
     );
 
-    CREATE INDEX ON {TABLE_NAME} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+    CREATE INDEX IF NOT EXISTS {TABLE_NAME}_embedding_ivfflat_idx
+        ON {TABLE_NAME} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+    CREATE INDEX IF NOT EXISTS {TABLE_NAME}_text_trgm_idx
+        ON {TABLE_NAME} USING gin (text gin_trgm_ops);
 """)
 
-print(f"Table '{TABLE_NAME}' created successfully.")
+print(f"Table '{TABLE_NAME}' is ready.")
 
 
 def retry(func, retries=5, base_delay=1):
