@@ -1,6 +1,7 @@
 import os
 import asyncio
 import random
+import re
 
 import google.generativeai as genai
 import psycopg2
@@ -18,6 +19,7 @@ from config import (
     DB_PORT,
     GROQ_API_KEY,
     DB_HOST,
+    GROQ_API_KEY,
     DB_NAME,
     TABLE_NAME,
     GROQ_API_KEY,
@@ -38,11 +40,34 @@ class AgentDependencies:
     table_name: str
 
 
+def _extract_query_keywords(query: str, max_keywords: int = 8) -> list[str]:
+    """Lightweight keyword extraction from the user's query.
+
+    This is intentionally simple and cheap: it just keeps unique alphabetic
+    tokens of length >= 3, lowercased, in order of appearance.
+    """
+
+    tokens = re.findall(r"[A-Za-z]{3,}", query.lower())
+    seen: set[str] = set()
+    keywords: list[str] = []
+    for tok in tokens:
+        if tok in seen:
+            continue
+        seen.add(tok)
+        keywords.append(tok)
+        if len(keywords) >= max_keywords:
+            break
+    return keywords
+
+
 async def rag_search_tool(
     ctx: RunContext[AgentDependencies],
     query: str,
     limit: int = 10,
     alpha: float = 0.7,
+    subject: str | None = None,
+    semester: int | None = None,
+    department: str | None = None,
 ) -> str:
     """Hybrid retrieval for the most relevant document chunks.
 
@@ -67,35 +92,109 @@ async def rag_search_tool(
     )
     query_embedding = result["embedding"]
 
+    # Derive simple keyword candidates from the query. If the database table
+    # has a `keywords` TEXT[] column populated for chunks, we will use these
+    # to pre-filter candidates. If the column does not exist, we fall back to
+    # a text-only hybrid search.
+    filter_keywords = _extract_query_keywords(query)
+    print(f"Query keywords: {filter_keywords}")
+
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            f"""
-            SELECT
-                text,
-                filename,
-                chunk_index,
-                chunk_type,
-                1 - (embedding <=> %s::vector) AS semantic_score,
-                similarity(text, %s) AS keyword_score,
-                (
-                    %s * (1 - (embedding <=> %s::vector))
-                    + (1 - %s) * similarity(text, %s)
-                ) AS hybrid_score
-            FROM {table_name}
-            ORDER BY hybrid_score DESC
-            LIMIT %s
-            """,
-            (
+        try:
+            params = [
                 query_embedding,
                 query,
                 alpha,
                 query_embedding,
                 alpha,
                 query,
-                limit,
-            ),
-        )
-        results = cur.fetchall()
+            ]
+
+            where_clauses: list[str] = []
+            if filter_keywords:
+                where_clauses.append("keywords && %s::text[]")
+                params.append(filter_keywords)
+
+            if subject is not None:
+                where_clauses.append("subject = %s")
+                params.append(subject)
+
+            if semester is not None:
+                where_clauses.append("semester = %s")
+                params.append(semester)
+
+            if department is not None:
+                where_clauses.append("department = %s")
+                params.append(department)
+
+            where_sql = ""
+            if where_clauses:
+                where_sql = " WHERE " + " AND ".join(where_clauses)
+
+            params.append(limit)
+
+            sql = f"""
+                SELECT
+                    text,
+                    filename,
+                    chunk_index,
+                    chunk_type,
+                    1 - (embedding <=> %s::vector) AS semantic_score,
+                    similarity(text, %s) AS keyword_score,
+                    (
+                        %s * (1 - (embedding <=> %s::vector))
+                        + (1 - %s) * similarity(text, %s)
+                    ) AS hybrid_score
+                FROM {table_name}
+                {where_sql}
+                ORDER BY hybrid_score DESC
+                LIMIT %s
+            """
+
+            cur.execute(sql, params)
+            results = cur.fetchall()
+
+        except psycopg2.Error as exc:
+            # If some metadata/keywords columns do not exist yet, fall back
+            # to a plain hybrid search over text + embeddings.
+            if (
+                isinstance(exc, psycopg2.Error)
+                and getattr(exc, "pgcode", None) == "42703"
+            ):
+                print(
+                    "One or more metadata/keyword columns not found; "
+                    "falling back to hybrid search without structured filters."
+                )
+                cur.execute(
+                    f"""
+                    SELECT
+                        text,
+                        filename,
+                        chunk_index,
+                        chunk_type,
+                        1 - (embedding <=> %s::vector) AS semantic_score,
+                        similarity(text, %s) AS keyword_score,
+                        (
+                            %s * (1 - (embedding <=> %s::vector))
+                            + (1 - %s) * similarity(text, %s)
+                        ) AS hybrid_score
+                    FROM {table_name}
+                    ORDER BY hybrid_score DESC
+                    LIMIT %s
+                    """,
+                    (
+                        query_embedding,
+                        query,
+                        alpha,
+                        query_embedding,
+                        alpha,
+                        query,
+                        limit,
+                    ),
+                )
+                results = cur.fetchall()
+            else:
+                raise
 
     print(
         f"RAG Tool (hybrid) - Retrieved {len(results)} results "
@@ -208,9 +307,9 @@ You receive:
 
 Rewrite the draft answer so that it is:
 - precise and technically correct,
-- natural and conversational, like a helpful human tutor,
 - well-structured for exam preparation (clear points, lists where useful).
 - DO NOT include any AI or system-related commentary in the final answer. The student should only see the polished response.
+- DO NOT include messages like "As an AI language model..." or "Based on the retrieved context..." or "Given the context..". Just provide the final answer as if you were a human tutor.
 
 If you are told that context was not enough, explicitly mention that
 limitation and avoid inventing unsupported facts.

@@ -5,6 +5,7 @@ from docling.datamodel.pipeline_options import (
     AcceleratorOptions,
     PdfPipelineOptions,
 )
+from docling.exceptions import ConversionError
 from pathlib import Path
 from multiprocessing import Pool
 
@@ -107,13 +108,34 @@ def parse_chunk(pdf, page, count):
 
 
 def parse_pages(pdf_path, page_range):
+    """Convert the given page range, splitting on Docling errors if needed.
+
+    If Docling raises a ConversionError for the full range, recursively split
+    the range to isolate problematic pages. Single pages that still fail are
+    skipped, but the rest of the document continues to be processed.
+    """
+
     global converter
     start, end = page_range
-    print(f"Processing pages {start}-{end}")
-    doc = converter.convert(pdf_path, page_range=(start, end + 1))
-    markdown = doc.document.export_to_markdown()
-    output_path = f"./markdowns/{pdf_path.stem}-{start}-{end}.md"
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(markdown)
 
-    print(f"Saved {output_path}")
+    def _convert_range(s: int, e: int, depth: int = 0, max_depth: int = 5):
+        print(f"Processing pages {s}-{e}")
+        try:
+            doc = converter.convert(pdf_path, page_range=(s, e + 1))
+            markdown = doc.document.export_to_markdown()
+            output_path = f"./markdowns/{pdf_path.stem}-{s}-{e}.md"
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(markdown)
+            print(f"Saved {output_path}")
+        except ConversionError as exc:
+            # If a range fails, try to bisect it until we either isolate
+            # individual failing pages or hit max_depth.
+            if s == e or depth >= max_depth:
+                print(f"Skipping pages {s}-{e} due to ConversionError: {exc}")
+                return
+
+            mid = (s + e) // 2
+            _convert_range(s, mid, depth + 1, max_depth=max_depth)
+            _convert_range(mid + 1, e, depth + 1, max_depth=max_depth)
+
+    _convert_range(start, end)
