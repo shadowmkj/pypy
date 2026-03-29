@@ -1,10 +1,9 @@
 from __future__ import annotations
-from typing import Literal, TypedDict
 import asyncio
-import streamlit as st
-from config import DB_NAME, DB_HOST, DB_PASSWORD, DB_PORT, DB_USER, TABLE_NAME
+import os
+from typing import Literal, TypedDict
 
-from pydantic import BaseModel
+import streamlit as st
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -14,18 +13,11 @@ from pydantic_ai.messages import (
 
 from dotenv import load_dotenv
 
-from agent import AgentDependencies, rag_agent, rag_pipeline_stream
-import psycopg2
-from pgvector.psycopg2 import register_vector
+from agent import rag_pipeline_stream
 
 load_dotenv()
 
-
-conn = psycopg2.connect(
-    dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
-)
-
-register_vector(conn)
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_TOKEN", "6000"))
 
 
 class ChatMessage(TypedDict):
@@ -50,31 +42,17 @@ def display_message_part(part):
 
 
 async def run_agent_with_streaming(user_input: str):
-    # async with rag_agent.run_stream(
-    #     user_input,
-    #     deps=AgentDependencies(db_connection=conn, table_name=TABLE_NAME),
-    #     # message_history=st.session_state.messages[:-1],
-    # ) as result:
-    async for result in rag_pipeline_stream(
+    partial_text = ""
+    message_placeholder = st.empty()
+    async for chunk in rag_pipeline_stream(
         user_input,
+        max_context_tokens=MAX_CONTEXT_TOKENS,
     ):
-        partial_text = ""
-        message_placeholder = st.empty()
-        async for chunk in result.stream_text(delta=True):
-            partial_text += chunk
-            message_placeholder.markdown(partial_text)
-        filtered_messages = [
-            msg
-            for msg in result.new_messages()
-            if not (
-                hasattr(msg, "parts")
-                and any(part.part_kind == "user-prompt" for part in msg.parts)
-            )
-        ]
-        st.session_state.messages.extend(filtered_messages)
-        st.session_state.messages.append(
-            ModelResponse(parts=[TextPart(content=partial_text)])
-        )
+        partial_text += chunk
+        message_placeholder.markdown(partial_text)
+    st.session_state.messages.append(
+        ModelResponse(parts=[TextPart(content=partial_text)])
+    )
 
 
 async def main():

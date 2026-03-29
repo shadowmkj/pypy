@@ -1,52 +1,136 @@
-import os
+"""Two-agent orchestration for syllabus-aware question answering.
+
+Architecture:
+  - Retrieval is handled deterministically in Python (no tool-calling).
+  - Agent 1 (Reasoning): Evaluates retrieved chunks and decides if context
+    is sufficient. If not, it suggests a refined query for another retrieval
+    pass. No tools are exposed to the model.
+  - Agent 2 (Response): Takes the final curated context and formats a clean,
+    student-facing answer. No tools are exposed to the model.
+
+This design avoids tool-calling hallucination issues with models that have
+unreliable function-calling support (e.g. Qwen via Groq).
+"""
+
+from __future__ import annotations
+
 import asyncio
-import random
+import os
 import re
-
-import google.generativeai as genai
-import psycopg2
 from dataclasses import dataclass
-from psycopg2.extras import RealDictCursor
-from pydantic import BaseModel
-from pydantic_ai import Agent, RunContext
-from dotenv import load_dotenv
+from typing import List, Optional
 
-from settings import AIConfig
+import psycopg2
+from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent
+
 from config import (
-    GEMINI_API_KEY,
-    DB_PASSWORD,
-    DB_USER,
-    DB_PORT,
-    GROQ_API_KEY,
-    DB_HOST,
-    GROQ_API_KEY,
     DB_NAME,
+    DB_PASSWORD,
+    DB_HOST,
+    DB_PORT,
+    DB_USER,
     TABLE_NAME,
     GROQ_API_KEY,
 )
-
+from settings import AIConfig
+from transformer import get_embeddings as local_embed
+from transformer import model as LOCAL_MODEL
 
 load_dotenv()
 
-genai.configure(api_key=GEMINI_API_KEY)  # type: ignore[attr-defined]
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-# Existing environment variable usage is preserved.
+LOCAL_EMBED_DIM = getattr(LOCAL_MODEL, "get_sentence_embedding_dimension", None)
+if callable(LOCAL_EMBED_DIM):
+    LOCAL_EMBED_DIM = LOCAL_EMBED_DIM()
+else:
+    LOCAL_EMBED_DIM = len(local_embed("dimension probe"))
+
+EMBED_DIM = int(os.getenv("EMBED_DIM", str(LOCAL_EMBED_DIM)))
+
+# Preserve legacy side-effect relied upon elsewhere.
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
+# Maximum number of retrieval iterations before forcing a stop.
+MAX_RETRIEVAL_ITERATIONS = 3
 
-@dataclass
-class AgentDependencies:
-    db_connection: psycopg2.extensions.connection
-    table_name: str
+
+# ---------------------------------------------------------------------------
+# Database Connection
+# ---------------------------------------------------------------------------
+
+
+def get_db_connection():
+    """Create a fresh psycopg2 connection to the pgvector database."""
+    return psycopg2.connect(
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pydantic Models
+# ---------------------------------------------------------------------------
+
+
+class RetrievedChunk(BaseModel):
+    """A single chunk returned from hybrid search."""
+
+    text: str
+    filename: str
+    chunk_index: int
+
+
+class ReasoningVerdict(BaseModel):
+    """Output of Agent 1 — the reasoning / evaluation agent."""
+
+    is_sufficient: bool = Field(
+        description="True if the retrieved context is enough to answer the question."
+    )
+    reasoning: str = Field(
+        description="Brief explanation of why the context is or isn't sufficient."
+    )
+    refined_query: Optional[str] = Field(
+        default=None,
+        description=(
+            "If is_sufficient is False, provide a refined search query to "
+            "fetch better context in the next retrieval pass. "
+            "Set to null if is_sufficient is True."
+        ),
+    )
+    selected_chunk_indices: List[int] = Field(
+        default_factory=list,
+        description=(
+            "Indices (0-based) of the chunks from the provided list that are "
+            "most relevant to answering the question. Include all useful ones."
+        ),
+    )
+
+
+class FinalAnswer(BaseModel):
+    """Output of Agent 2 — the answer formatting agent."""
+
+    answer: str = Field(description="The comprehensive student-facing answer.")
+    confidence_note: str = Field(
+        description="Short note on confidence based on syllabus coverage."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Search (deterministic Python — no tool-calling)
+# ---------------------------------------------------------------------------
 
 
 def _extract_query_keywords(query: str, max_keywords: int = 8) -> list[str]:
-    """Lightweight keyword extraction from the user's query.
-
-    This is intentionally simple and cheap: it just keeps unique alphabetic
-    tokens of length >= 3, lowercased, in order of appearance.
-    """
-
+    """Pull simple keyword tokens from the query for keyword-overlap filtering."""
     tokens = re.findall(r"[A-Za-z]{3,}", query.lower())
     seen: set[str] = set()
     keywords: list[str] = []
@@ -60,48 +144,27 @@ def _extract_query_keywords(query: str, max_keywords: int = 8) -> list[str]:
     return keywords
 
 
-async def rag_search_tool(
-    ctx: RunContext[AgentDependencies],
+def rag_search(
+    conn,
+    table_name: str,
     query: str,
-    limit: int = 10,
+    limit: int = 5,
     alpha: float = 0.7,
-    subject: str | None = None,
-    semester: int | None = None,
-    department: str | None = None,
-) -> str:
-    """Hybrid retrieval for the most relevant document chunks.
+) -> list[RetrievedChunk]:
+    """Run hybrid semantic + lexical search and return typed chunks.
 
-    - Computes an embedding for the query and uses pgvector for semantic
-      similarity.
-    - Uses pg_trgm `similarity(text, query)` for lexical matching.
-    - Combines both into a single hybrid score:
-
-        hybrid_score = alpha * semantic_score + (1 - alpha) * keyword_score
-
-      where semantic_score = 1 - (embedding <=> query_embedding).
+    This function is called directly from Python orchestration code,
+    never from a model tool-call.
     """
+    query_embedding = local_embed(query)
+    if hasattr(query_embedding, "tolist"):
+        query_embedding = query_embedding.tolist()
 
-    conn = ctx.deps.db_connection
-    table_name = ctx.deps.table_name
-
-    result = genai.embed_content(  # type: ignore[attr-defined]
-        model="gemini-embedding-001",
-        content=query,
-        task_type="retrieval_query",
-        output_dimensionality=1536,
-    )
-    query_embedding = result["embedding"]
-
-    # Derive simple keyword candidates from the query. If the database table
-    # has a `keywords` TEXT[] column populated for chunks, we will use these
-    # to pre-filter candidates. If the column does not exist, we fall back to
-    # a text-only hybrid search.
     filter_keywords = _extract_query_keywords(query)
-    print(f"Query keywords: {filter_keywords}")
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         try:
-            params = [
+            params: list = [
                 query_embedding,
                 query,
                 alpha,
@@ -109,28 +172,13 @@ async def rag_search_tool(
                 alpha,
                 query,
             ]
-
             where_clauses: list[str] = []
+
             if filter_keywords:
                 where_clauses.append("keywords && %s::text[]")
                 params.append(filter_keywords)
 
-            if subject is not None:
-                where_clauses.append("subject = %s")
-                params.append(subject)
-
-            if semester is not None:
-                where_clauses.append("semester = %s")
-                params.append(semester)
-
-            if department is not None:
-                where_clauses.append("department = %s")
-                params.append(department)
-
-            where_sql = ""
-            if where_clauses:
-                where_sql = " WHERE " + " AND ".join(where_clauses)
-
+            where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
             params.append(limit)
 
             sql = f"""
@@ -150,37 +198,26 @@ async def rag_search_tool(
                 ORDER BY hybrid_score DESC
                 LIMIT %s
             """
-
             cur.execute(sql, params)
             results = cur.fetchall()
 
         except psycopg2.Error as exc:
-            # If some metadata/keywords columns do not exist yet, fall back
-            # to a plain hybrid search over text + embeddings.
-            if (
-                isinstance(exc, psycopg2.Error)
-                and getattr(exc, "pgcode", None) == "42703"
-            ):
-                print(
-                    "One or more metadata/keyword columns not found; "
-                    "falling back to hybrid search without structured filters."
-                )
+            # Fallback: if columns like 'keywords' don't exist, retry without filters.
+            if getattr(exc, "pgcode", None) == "42703":
+                conn.rollback()
                 cur.execute(
                     f"""
-                    SELECT
-                        text,
-                        filename,
-                        chunk_index,
-                        chunk_type,
-                        1 - (embedding <=> %s::vector) AS semantic_score,
-                        similarity(text, %s) AS keyword_score,
-                        (
-                            %s * (1 - (embedding <=> %s::vector))
-                            + (1 - %s) * similarity(text, %s)
-                        ) AS hybrid_score
-                    FROM {table_name}
-                    ORDER BY hybrid_score DESC
-                    LIMIT %s
+                        SELECT
+                            text, filename, chunk_index, chunk_type,
+                            1 - (embedding <=> %s::vector) AS semantic_score,
+                            similarity(text, %s) AS keyword_score,
+                            (
+                                %s * (1 - (embedding <=> %s::vector))
+                                + (1 - %s) * similarity(text, %s)
+                            ) AS hybrid_score
+                        FROM {table_name}
+                        ORDER BY hybrid_score DESC
+                        LIMIT %s
                     """,
                     (
                         query_embedding,
@@ -196,202 +233,295 @@ async def rag_search_tool(
             else:
                 raise
 
+    chunks = [
+        RetrievedChunk(
+            text=row["text"],
+            filename=row["filename"],
+            chunk_index=row["chunk_index"],
+        )
+        for row in results
+    ]
     print(
-        f"RAG Tool (hybrid) - Retrieved {len(results)} results "
-        f"from PostgreSQL with alpha={alpha}, limit={limit}."
+        f"RAG Search — Retrieved {len(chunks)} chunks for query: "
+        f"{query[:80]!r} (alpha={alpha}, limit={limit})"
     )
-    for r in results:
-        print(
-            f"Snippet: {r['text'][:100]!r}... "
-            f"(semantic={r['semantic_score']:.4f}, "
-            f"keyword={r['keyword_score']:.4f}, "
-            f"hybrid={r['hybrid_score']:.4f})"
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_chunks_for_prompt(chunks: list[RetrievedChunk]) -> str:
+    """Render a numbered list of chunks suitable for inclusion in a prompt."""
+    if not chunks:
+        return "(no chunks retrieved)"
+    parts: list[str] = []
+    for idx, c in enumerate(chunks):
+        parts.append(
+            f"[{idx}] (file: {c.filename}, chunk #{c.chunk_index}):\n{c.text.strip()}"
+        )
+    return "\n\n".join(parts)
+
+
+def _truncate_text(text: str, max_tokens: int | None) -> str:
+    """Rough word-level truncation."""
+    if not max_tokens or max_tokens <= 0:
+        return text
+    words = text.split()
+    if len(words) <= max_tokens:
+        return text
+    return " ".join(words[:max_tokens])
+
+
+def _deduplicate_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+    """Remove duplicate chunks based on (filename, chunk_index)."""
+    seen: set[tuple[str, int]] = set()
+    unique: list[RetrievedChunk] = []
+    for c in chunks:
+        key = (c.filename, c.chunk_index)
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# Agent 1 — Reasoning / Evaluation (NO tools)
+# ---------------------------------------------------------------------------
+
+reasoning_agent = Agent(
+    AIConfig.reasoning_model,
+    output_type=ReasoningVerdict,
+    system_prompt=(
+        "You are a Retrieval Evaluation Agent.\n\n"
+        "You will receive a student's question and a numbered list of text "
+        "chunks retrieved from a syllabus database.\n\n"
+        "Your ONLY job is to evaluate the chunks and respond with structured "
+        "JSON matching the output schema.\n\n"
+        "Rules:\n"
+        "1. Decide if the chunks contain enough information to fully answer "
+        "   the question. Set `is_sufficient` accordingly.\n"
+        "2. In `reasoning`, briefly explain your judgment (1-2 sentences).\n"
+        "3. If `is_sufficient` is False, provide a `refined_query` — a better "
+        "   search phrase that might retrieve the missing information.\n"
+        "4. In `selected_chunk_indices`, list the 0-based indices of chunks "
+        "   that are actually relevant. Omit irrelevant ones.\n\n"
+        "DO NOT call any tools. DO NOT generate an answer to the question. "
+        "Just evaluate the context and return your verdict."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Agent 2 — Answer Formatting (NO tools)
+# ---------------------------------------------------------------------------
+
+response_agent = Agent(
+    AIConfig.model_name,
+    # NOTE: No output_type here — plain text output avoids Groq's
+    # tool-calling failures with the internal `final_result` function.
+    system_prompt=(
+        "You are the Answer Generation Agent for SyllabiQ, a university "
+        "learning assistant.\n\n"
+        "You will receive a student's question and supporting syllabus "
+        "context chunks.\n\n"
+        "Formatting rules (CRITICAL — you are helping students learn):\n"
+        "- Structure your answer using **numbered points** or **bullet points**.\n"
+        "- Start with a brief 1-2 sentence overview, then break the explanation "
+        "  into clear, digestible points.\n"
+        "- Use **bold** for key terms and definitions.\n"
+        "- Include short examples or analogies where helpful.\n"
+        "- For multi-part topics, use sub-points (e.g. 1a, 1b).\n"
+        "- End with a concise summary or takeaway if the answer is long.\n\n"
+        "Content rules:\n"
+        "- Write a precise, exam-ready answer using ONLY the provided context.\n"
+        "- If the context is insufficient, say so transparently.\n"
+        "- DO NOT hallucinate or invent information beyond the context.\n"
+        "- DO NOT mention 'agents', 'tools', 'retrieval', 'chunks', or any "
+        "  internal mechanics.\n"
+        "- Just produce the answer as plain text. Do NOT call any tools or "
+        "  functions.\n"
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestration
+# ---------------------------------------------------------------------------
+
+
+class PipelineError(RuntimeError):
+    """Raised when the pipeline cannot produce an answer."""
+
+
+async def _run_with_retry(coro_factory, *, attempts: int = 3, delay: float = 1.0):
+    """Generic async retry wrapper with exponential back-off."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_factory()
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            wait = delay * (2 ** (attempt - 1))
+            print(
+                f"Attempt {attempt}/{attempts} failed: {exc!r}. "
+                f"Retrying in {wait:.1f}s..."
+            )
+            await asyncio.sleep(wait)
+
+
+async def run_two_agent_pipeline(
+    question: str,
+    *,
+    max_context_tokens: int | None = None,
+) -> FinalAnswer:
+    """Execute the full two-agent RAG pipeline.
+
+    Steps:
+      1. Retrieve chunks from pgvector (deterministic Python call).
+      2. Ask Agent 1 to evaluate if context is sufficient.
+      3. If Agent 1 says no, refine the query and retrieve again (up to
+         MAX_RETRIEVAL_ITERATIONS).
+      4. Pass final curated context to Agent 2 for answer generation.
+    """
+    conn = get_db_connection()
+
+    try:
+        # ---- Stage 1: Iterative retrieval with reasoning loop ----
+        all_chunks: list[RetrievedChunk] = []
+        current_query = question
+
+        for iteration in range(1, MAX_RETRIEVAL_ITERATIONS + 1):
+            print(
+                f"\n--- Retrieval iteration {iteration}/{MAX_RETRIEVAL_ITERATIONS} ---"
+            )
+
+            # Always call rag_search (deterministic, no tool-calling)
+            new_chunks = rag_search(conn, TABLE_NAME, current_query, limit=5)
+            all_chunks.extend(new_chunks)
+            all_chunks = _deduplicate_chunks(all_chunks)
+
+            # Build the evaluation prompt for Agent 1
+            chunks_text = _format_chunks_for_prompt(all_chunks)
+            eval_prompt = (
+                f"Student question:\n{question}\n\n"
+                f"Retrieved chunks (total {len(all_chunks)}):\n{chunks_text}"
+            )
+
+            # Ask Agent 1 to evaluate
+            async def reasoning_call():
+                return await reasoning_agent.run(eval_prompt)
+
+            try:
+                reasoning_result = await _run_with_retry(reasoning_call, attempts=2)
+                verdict: ReasoningVerdict = reasoning_result.output
+            except Exception as exc:
+                # If the reasoning agent fails, just use all chunks and proceed
+                print(f"Reasoning agent failed: {exc!r}. Using all retrieved chunks.")
+                verdict = ReasoningVerdict(
+                    is_sufficient=True,
+                    reasoning="Reasoning agent unavailable; proceeding with all chunks.",
+                    selected_chunk_indices=list(range(len(all_chunks))),
+                )
+
+            print(
+                f"Verdict: sufficient={verdict.is_sufficient}, "
+                f"reasoning={verdict.reasoning!r}, "
+                f"refined_query={verdict.refined_query!r}"
+            )
+
+            # If sufficient or last iteration, stop retrieving
+            if verdict.is_sufficient or iteration == MAX_RETRIEVAL_ITERATIONS:
+                break
+
+            # Refine the query for the next pass
+            if verdict.refined_query:
+                current_query = verdict.refined_query
+            else:
+                # No refined query suggested; stop
+                break
+
+        # ---- Select relevant chunks ----
+        if verdict.selected_chunk_indices:
+            selected = [
+                all_chunks[i]
+                for i in verdict.selected_chunk_indices
+                if 0 <= i < len(all_chunks)
+            ]
+            # Fallback if indices were all out of range
+            if not selected:
+                selected = all_chunks
+        else:
+            selected = all_chunks
+
+        # ---- Stage 2: Answer generation ----
+        context_text = _format_chunks_for_prompt(selected)
+        if max_context_tokens:
+            context_text = _truncate_text(context_text, max_context_tokens)
+
+        answer_prompt = (
+            f"Student question:\n{question}\n\n"
+            f"Supporting syllabus context:\n"
+            f"{context_text if selected else '(No relevant context found in the syllabus.)'}\n\n"
+            f"Context sufficiency: {
+                'sufficient' if verdict.is_sufficient else 'insufficient'
+            }\n"
         )
 
-    context = "\n---\n".join([f"Content: {res['text']}" for res in results])
-    return f"Retrieved Context:\n{context}"
+        async def response_call():
+            return await response_agent.run(answer_prompt)
 
-
-conn = psycopg2.connect(
-    dbname=DB_NAME,
-    user=DB_USER,
-    password=DB_PASSWORD,
-    host=DB_HOST,
-    port=DB_PORT,
-)
-
-
-class RetrievalResult(BaseModel):
-    """Output of the retrieval / planning agent.
-
-    - enough_context: whether the retrieved chunks are sufficient.
-    - draft_answer: initial answer based only on retrieved context.
-    - context_chunks: text snippets actually used in the draft answer.
-    """
-
-    enough_context: bool
-    draft_answer: str
-    context_chunks: list[str]
-    notes: str | None = None
-
-
-# First agent: retrieve context and draft an answer.
-rag_agent = Agent(
-    AIConfig.model_name,
-    deps_type=AgentDependencies,
-    tools=[rag_search_tool],
-    output_type=RetrievalResult,
-    system_prompt=(
-        """
-You are SyllabiQ's retrieval and planning agent.
-
-Your job is iterative hybrid retrieval and planning for a RAG system.
-
-Capabilities:
-- You can call `rag_search_tool(query: str, limit: int = 10, alpha: float = 0.7)`
-  multiple times.
-- Each call performs HYBRID retrieval over the knowledge base using both
-  semantic (pgvector) and lexical (pg_trgm) similarity.
-
-Workflow:
-
-1. Start from the student's question.
-2. Form an initial retrieval query (often the question itself) and call
-   `rag_search_tool`.
-3. Carefully read the returned chunks. Decide:
-   - what parts of the question are still not covered;
-   - what follow-up or more specific sub-queries are needed.
-4. Refine the query (for example, add course/unit/topic keywords, important
-   terms, or constraints) and call `rag_search_tool` again.
-5. Repeat steps 3–4, up to about 3–5 tool calls in total, until:
-   - you have enough coverage to answer the question reliably, or
-   - it is clear the knowledge base does not contain the answer.
-
-When you finish, fill the `RetrievalResult` fields as follows:
-- `enough_context`: true only if the retrieved chunks clearly provide enough
-  information to answer the question. Otherwise false.
-- `draft_answer`: a careful, step-by-step answer that uses only the retrieved
-  chunks. If context is not enough, clearly say that and explain what is
-  missing or why the syllabus does not cover it.
-- `context_chunks`: a list of the most relevant text snippets you actually
-  used when forming the answer. Prefer concise but complete excerpts.
-- `notes`: (optional) short planner notes about how many retrieval calls
-  you made, which queries you used, and why you stopped.
-
-Rules:
-- Use ONLY the knowledge you retrieved with `rag_search_tool`.
-- If the question is out of syllabus or the context is clearly insufficient,
-  set `enough_context` to false and state this explicitly in `draft_answer`.
-- Avoid repeating identical or obviously redundant chunks.
-"""
-    ),
-)
-
-
-# Second agent: polish and format the final answer.
-answer_agent = Agent(
-    AIConfig.model_name,
-    system_prompt=(
-        """
-You are SyllabiQ, an academic assistant trained specifically on the
-KTU B.Tech CSE curriculum (later expandable to other branches and semesters).
-
-Your purpose is to help students understand concepts, answer syllabus
-questions, explain topics, provide point-wise exam answers, and offer
-evaluation-focused guidance.
-
-You receive:
-- the student's original question,
-- a draft answer written by another agent,
-- and the context snippets that were used.
-
-Rewrite the draft answer so that it is:
-- precise and technically correct,
-- well-structured for exam preparation (clear points, lists where useful).
-- DO NOT include any AI or system-related commentary in the final answer. The student should only see the polished response.
-- DO NOT include messages like "As an AI language model..." or "Based on the retrieved context..." or "Given the context..". Just provide the final answer as if you were a human tutor.
-
-If you are told that context was not enough, explicitly mention that
-limitation and avoid inventing unsupported facts.
-Do not mention that another agent wrote the draft; just answer as SyllabiQ.
-"""
-    ),
-)
-
-
-async def rag_pipeline_stream(query: str):
-    """Two-agent pipeline used by the Streamlit UI.
-
-    1. `rag_agent` retrieves context and drafts an answer.
-    2. `answer_agent` rewrites the draft into a polished final response,
-       which is streamed back to the caller.
-
-    This is implemented as an async generator that yields a single
-    streaming result object compatible with `result.stream_text(...)` and
-    `result.new_messages()`, matching the expectations in `ai.py`.
-    """
-
-    # Retry retrieval a few times in case of transient failures.
-    max_retries = 3
-    retrieval = None
-    for attempt in range(max_retries):
         try:
-            retrieval = await rag_agent.run(
-                query,
-                deps=AgentDependencies(db_connection=conn, table_name=TABLE_NAME),
-            )
-            break
-        except Exception as exc:  # pragma: no cover - defensive logging
-            if attempt == max_retries - 1:
-                # Out of retries; re-raise so the UI can show an error.
-                raise
-            # Simple exponential backoff.
-            wait = 1.0 * (2**attempt)
-            print(
-                f"rag_agent.run failed (attempt {attempt + 1}/{max_retries}): {exc}. "
-                f"Retrying in {wait:.1f}s..."
-            )
-            await asyncio.sleep(wait)
+            response_result = await _run_with_retry(response_call, attempts=2)
+            # response_agent returns plain text (no structured output)
+            answer_text = str(response_result.output).strip()
+        except Exception as exc:
+            raise PipelineError(f"Response generation failed: {exc}") from exc
 
-    if retrieval is None:  # Defensive, should be unreachable.
-        raise RuntimeError("Retrieval agent did not return a result")
+        # Build the FinalAnswer ourselves from plain text + verdict
+        confidence_note = (
+            "Grounded in retrieved syllabus excerpts."
+            if verdict.is_sufficient
+            else "Topic not fully covered in the available syllabus."
+        )
 
-    retrieval_output = retrieval.output
+        return FinalAnswer(answer=answer_text, confidence_note=confidence_note)
 
-    context_text = "\n\n".join(retrieval_output.context_chunks)
-    sufficiency = "enough" if retrieval_output.enough_context else "not enough"
+    except PipelineError:
+        raise
+    except Exception as exc:
+        raise PipelineError(f"Pipeline failed: {exc}") from exc
+    finally:
+        conn.close()
 
-    prompt = f"""Question:
-{query}
 
-Draft answer (from retrieval agent):
-{retrieval_output.draft_answer}
+async def rag_pipeline_stream(
+    question: str,
+    *,
+    max_context_tokens: int | None = None,
+):
+    """Compatibility wrapper for the existing Streamlit consumer.
 
-Context sufficiency: {sufficiency}
+    Yields the final answer as a single string chunk.
+    """
+    try:
+        final_answer = await run_two_agent_pipeline(
+            question,
+            max_context_tokens=max_context_tokens,
+        )
+        yield final_answer.answer
+    except PipelineError as exc:
+        yield f"SyllabiQ ran into an issue: {exc}"
 
-Context used:
-{context_text}
 
-Rewrite the draft answer into the best possible response for the student.
-"""
-
-    # Retry opening the streaming answer as well; if it fails after all
-    # retries, propagate the error so the caller can handle it.
-    for attempt in range(max_retries):
-        try:
-            async with answer_agent.run_stream(prompt) as result:
-                # Yield the streaming result so the Streamlit layer can consume
-                # `result.stream_text(delta=True)` and handle `new_messages()`.
-                yield result
-            break
-        except Exception as exc:  # pragma: no cover - defensive logging
-            if attempt == max_retries - 1:
-                raise
-            wait = 1.0 * (2**attempt)
-            print(
-                f"answer_agent.run_stream failed (attempt {attempt + 1}/{
-                    max_retries
-                }): {exc}. "
-                f"Retrying in {wait:.1f}s..."
-            )
-            await asyncio.sleep(wait)
+__all__ = [
+    "run_two_agent_pipeline",
+    "rag_pipeline_stream",
+    "reasoning_agent",
+    "response_agent",
+    "FinalAnswer",
+    "ReasoningVerdict",
+    "RetrievedChunk",
+]
