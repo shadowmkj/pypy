@@ -121,7 +121,6 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 register_vector(conn)
 
-
 # Ensure table and columns exist (idempotent schema setup).
 cur.execute(
     f"""
@@ -356,9 +355,6 @@ def process_and_store_md(file_path: str, stop: bool = False):
     chunker = HybridChunker(max_tokens=512, overlap_tokens=80, merge_peers=True)
     chunk_iter = list(chunker.chunk(doc))
     print(f"Total chunks for {file_path}: {len(chunk_iter)}")
-    if stop:
-        return
-
     if stop:
         return
 

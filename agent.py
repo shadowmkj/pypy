@@ -327,6 +327,8 @@ response_agent = Agent(
         "learning assistant.\n\n"
         "You will receive a student's question and supporting syllabus "
         "context chunks.\n\n"
+        "IF THE QUESTION IS OUT OF SYLLABUS JUST ANSWER IN ONE SENTENCE\n"
+        "DO NOT EXPLAIN WHAT THE CONTEXT IS ABOUT JUST DECLINE TO ANSWER IN A SENTENCE\n"
         "Formatting rules (CRITICAL — you are helping students learn):\n"
         "- Structure your answer using **numbered points** or **bullet points**.\n"
         "- Start with a brief 1-2 sentence overview, then break the explanation "

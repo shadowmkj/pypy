@@ -26,7 +26,11 @@ export default async function Home() {
   return (
     <main className="flex min-h-screen flex-col items-center justify-between">
       <div className="w-full max-w-7xl mx-auto h-screen relative">
-        <ChatContainer userInitials={userInitials} userName={userName} />
+        <ChatContainer
+          userInitials={userInitials}
+          userName={userName}
+          userId={session.userId}
+        />
       </div>
     </main>
   );

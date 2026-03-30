@@ -15,6 +15,27 @@ model User {
   email        String   @unique
   name         String?
   passwordHash String
+  chatSessions ChatSession[]
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+}
+
+model ChatSession {
+    id Int @id @default(autoincrement())
+    userId Int
+    title String
+    user User @relation(fields: [userId], references: [id])
+    chats Chat[]
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+}
+
+model Chat {
+    id Int @id @default(autoincrement())
+    sessionId Int
+    isResponse Boolean // true for user, false for assistant
+    content String
+    session ChatSession @relation(fields: [sessionId], references: [id])
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 }
